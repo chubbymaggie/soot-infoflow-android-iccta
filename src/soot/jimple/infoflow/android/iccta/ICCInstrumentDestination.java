@@ -5,6 +5,7 @@ import java.util.Iterator;
 import java.util.List;
 
 import soot.Body;
+import soot.IntType;
 import soot.Local;
 import soot.Modifier;
 import soot.PatchingChain;
@@ -18,9 +19,15 @@ import soot.Unit;
 import soot.Value;
 import soot.VoidType;
 import soot.javaToJimple.LocalGenerator;
+import soot.jimple.AssignStmt;
+import soot.jimple.IdentityStmt;
+import soot.jimple.IntConstant;
+import soot.jimple.InvokeExpr;
 import soot.jimple.Jimple;
+import soot.jimple.NullConstant;
 import soot.jimple.ReturnStmt;
 import soot.jimple.Stmt;
+import soot.util.Chain;
 
 
 /**
@@ -84,7 +91,23 @@ public class ICCInstrumentDestination
         }
 
         for (SootMethod sm: sc.getMethods())
-            System.out.println("wrapper method "+ sm +" \n"+ sm.retrieveActiveBody());
+        {
+        	try
+        	{
+        		//abstract and native method do not have a body inside.
+        		if (sm.isAbstract() || sm.isNative())
+        		{
+        			continue;
+        		}
+        		
+        		System.out.println("wrapper method "+ sm +" \n"+ sm.retrieveActiveBody());
+        	}
+        	catch (Exception ex)
+        	{
+        		System.out.println("Exception: to retrieve activi body for " + sm.getSignature());
+        	}
+        }
+            
         
         return sc;
     }
@@ -204,10 +227,49 @@ public class ICCInstrumentDestination
         Unit intentParameterU = Jimple.v().newIdentityStmt(
                 intentParameterLocal,
                 Jimple.v().newParameterRef(INTENT_TYPE, 0));
-        Unit superU = (Unit) Jimple.v().newInvokeStmt(
+        
+        boolean noDefaultConstructMethod = false;
+        Unit superU = null;
+        try
+        {
+        	superU = (Unit) Jimple.v().newInvokeStmt(
                 Jimple.v().newSpecialInvokeExpr(thisLocal, 
-                		compSootClass.getMethod(name, new ArrayList<Type>(), VoidType.v()).makeRef())
-                        );
+            		compSootClass.getMethod(name, new ArrayList<Type>(), VoidType.v()).makeRef())
+                    );
+        }
+        catch (Exception ex)
+        {
+        	//It is possible that a class doesn't have a default construct method (<init>()).
+            noDefaultConstructMethod = true;
+        }
+        
+        if (noDefaultConstructMethod)
+        {
+        	List<SootMethod> sootMethods = compSootClass.getMethods();
+        	for (SootMethod sm : sootMethods)
+        	{
+        		if (sm.getName().equals("<init>"))
+        		{
+        			if (sm.getParameterCount() == 1 && sm.getParameterType(0).equals(INTENT_TYPE))
+        			{
+        				List<Value> args = new ArrayList<Value>();
+        				args.add(intentParameterLocal);
+        				superU = (Unit) Jimple.v().newInvokeStmt(Jimple.v().newSpecialInvokeExpr(thisLocal, sm.makeRef(), args));
+        				continue;
+        			}
+        			
+        			List<Value> args = new ArrayList<Value>();
+        			for (int i = 0; i < sm.getParameterCount(); i++)
+        			{
+        				args.add(NullConstant.v());
+        			}
+        			
+        			superU = (Unit) Jimple.v().newInvokeStmt(Jimple.v().newSpecialInvokeExpr(thisLocal, sm.makeRef(), args));
+        			break;
+        		}
+        	}
+        }
+        
         Unit storeIntentU = Jimple.v().newAssignStmt(
                 Jimple.v().newStaticFieldRef(intentSootField.makeRef()), 
                 intentParameterLocal);
@@ -389,10 +451,28 @@ public class ICCInstrumentDestination
     	
     	Body body = mainMethod.getActiveBody();
     	
+    	//For the purpose of confusion dex optimization (because of the strategy of generating dummyMain method)
+    	boolean firstStmt = true;
+    	
     	PatchingChain<Unit> units = body.getUnits();
     	for (Iterator<Unit> iter = units.snapshotIterator(); iter.hasNext(); )
     	{
     		Stmt stmt = (Stmt) iter.next();
+    		
+    		if (stmt instanceof IdentityStmt)
+    		{
+    			continue;
+    		}
+    		   		
+    		if (firstStmt)
+    		{
+    			firstStmt = false;
+    			AssignStmt aStmt = (AssignStmt) stmt;
+    			SootMethod fuzzyMe = generateFuzzyMethod(compSootClass);
+    			InvokeExpr invokeExpr = Jimple.v().newVirtualInvokeExpr(body.getThisLocal(), fuzzyMe.makeRef());
+    			Unit assignU = Jimple.v().newAssignStmt(aStmt.getLeftOp(), invokeExpr);
+    			units.insertAfter(assignU, aStmt);
+    		}
     		
     		if (! stmt.containsInvokeExpr())
     		{
@@ -403,9 +483,9 @@ public class ICCInstrumentDestination
     		{
     			continue;
     		}
-    		
+    			
     		List<Value> argValues = stmt.getInvokeExpr().getArgs();	
-    		
+    		/*
     		for (Value value : argValues)
     		{
     			Type type = value.getType();
@@ -414,9 +494,99 @@ public class ICCInstrumentDestination
     				Unit setIntentU = Jimple.v().newAssignStmt(     
     						value,
     	                    Jimple.v().newStaticFieldRef(intentSootField.makeRef()));
+    				
     	    		units.insertBefore(setIntentU, stmt);
     			}
+    		}*/
+    		
+    		//Using another way to transfer Intent
+    		for (int i = 0; i < argValues.size(); i++)
+    		{
+    			Value value = argValues.get(i);
+    			Type type = value.getType();
+    			if (type.equals(INTENT_TYPE))
+    			{
+    				assignIntent(compSootClass, stmt.getInvokeExpr().getMethod(), i+1);
+    			}
     		}
+    	}
+    }
+    
+    public SootMethod generateFuzzyMethod(SootClass sootClass)
+	{
+    	String name = "fuzzyMe";
+	    List<Type> parameters = new ArrayList<Type>();
+	    Type returnType = IntType.v();
+	    int modifiers = Modifier.PUBLIC;
+	    SootMethod fuzzyMeMethod = new SootMethod(name, parameters, returnType, modifiers);
+	    sootClass.addMethod(fuzzyMeMethod);
+	    
+	    {
+	    	Body b = Jimple.v().newBody(fuzzyMeMethod);
+	    	fuzzyMeMethod.setActiveBody(b);
+	    	LocalGenerator lg = new LocalGenerator(b);
+	        Local thisLocal = lg.generateLocal(sootClass.getType());
+	        Unit thisU = Jimple.v().newIdentityStmt(thisLocal, 
+	                Jimple.v().newThisRef(sootClass.getType()));
+	        Unit returnU = Jimple.v().newReturnStmt(IntConstant.v(1));
+	        b.getUnits().add(thisU);
+	        b.getUnits().add(returnU);
+	    }
+	        
+	    return fuzzyMeMethod;
+	}
+    
+    public void assignIntent(SootClass hostComponent, SootMethod method, int indexOfArgs)
+    {
+    	Body body = method.getActiveBody();
+
+    	PatchingChain<Unit> units = body.getUnits();
+    	Chain<Local> locals = body.getLocals();
+    	Value intentV = null;
+		int identityStmtIndex = 0;
+		
+    	for (Iterator<Unit> iter = units.snapshotIterator(); iter.hasNext(); )
+    	{
+    		Stmt stmt = (Stmt) iter.next();
+			if (! method.isStatic())
+			{
+	    		if (stmt instanceof IdentityStmt)
+	    		{			
+	    			if (identityStmtIndex == indexOfArgs)
+	    			{
+	    				intentV = ((IdentityStmt) stmt).getLeftOp();
+	    			}
+	    			
+	    			identityStmtIndex++;
+	    		}
+	    		else
+	    		{
+	    	 		Local thisLocal = locals.getFirst();
+	    			
+	    	 		/*
+	    			Unit setIntentU = Jimple.v().newAssignStmt(     
+	    					intentV,
+	    					Jimple.v().newVirtualInvokeExpr(thisLocal, method.getDeclaringClass().getMethodByName("getIntent").makeRef()));
+					*/
+	    	 		
+	    	 		/* Using the component that the dummyMain() belongs to, as in some cases the invoked method is only available in its superclass.
+	    	 		 * and its superclass does not contain getIntent() and consequently cause an runtime exception of couldn't find getIntent(). 
+	    	 		 * 
+	    	 		 * RuntimeException: couldn't find method getIntent(*) in com.google.android.gcm.GCMBroadcastReceiver
+	    	 		*/
+	    	 		Unit setIntentU = Jimple.v().newAssignStmt(     
+	    					intentV,
+	    					Jimple.v().newVirtualInvokeExpr(thisLocal, hostComponent.getMethodByName("getIntent").makeRef()));
+	    	 		
+		    		units.insertBefore(setIntentU, stmt);
+		    		
+		    		System.out.println(body);
+		    		
+		    		return;
+	    		}
+			}
+			
+    		
     	}
     }
     
@@ -494,6 +664,7 @@ public class ICCInstrumentDestination
     		return null;
     	}
     	
+    	
     	Body body = onBindMethod.retrieveActiveBody();
     	PatchingChain<Unit> units = body.getUnits();
     	for (Iterator<Unit> iter = units.snapshotIterator(); iter.hasNext(); )
@@ -505,10 +676,16 @@ public class ICCInstrumentDestination
     			ReturnStmt rtStmt = (ReturnStmt) stmt;
     			Value rtValue = rtStmt.getOp();
     			
+    			if (rtValue.toString().equals("null"))
+    			{
+    				return onBindMethod.getReturnType();
+    			}
+    			
     			return rtValue.getType();
     		}
     		
     	}
-    	return null;
+    	
+    	return onBindMethod.getReturnType();
     }
 }
